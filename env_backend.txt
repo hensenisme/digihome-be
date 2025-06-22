@@ -1,0 +1,6 @@
+MONGO_URI=mongodb://digihomeAdmin:digi423@127.0.0.1:27017/digihomeDB
+PORT=5000
+JWT_SECRET=rahasia-banget-jangan-disebar
+MQTT_BROKER_URL=test.mosquitto.org
+# MQTT_USERNAME= (kosongkan jika tidak ada)
+# MQTT_PASSWORD= (kosongkan jika tidak ada)
