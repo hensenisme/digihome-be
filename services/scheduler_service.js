@@ -105,7 +105,7 @@ const startScheduler = (clientConnections) => {
                 power: targetState ? Math.random() * 50 + 10 : 0,
                 voltage: 220,
                 current: targetState ? Math.random() * 0.5 : 0,
-                energyKWh: device.energyKWh || 0,
+                energyKWh: 0, // Nilai energi tidak relevan untuk update status
                 powerFactor: 0.9,
                 status: targetState ? 'ON' : 'OFF', // INI PERUBAHANNYA
               });
