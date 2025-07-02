@@ -397,57 +397,97 @@ _Path: relPath:~=~_
 // controllers/deviceController.js
 
 const Device = require('../models/Device');
-const Schedule = require('../models/Schedule');
 const asyncHandler = require('../middleware/asyncHandler');
-const { publishMqttMessage } = require('../services/mqtt_service');
 
-// --- FUNGSI BARU UNTUK KLAIM PERANGKAT ---
-// @desc    Claim a new device and assign it to the user
-// @route   POST /api/devices/claim
-// @access  Private
-const claimDevice = asyncHandler(async (req, res) => {
-    const { deviceId, secretKey } = req.body;
-    if (!deviceId || !secretKey) {
-        res.status(400);
-        throw new Error('deviceId dan secretKey diperlukan.');
+// ======================= PERBAIKAN UTAMA DI SINI =======================
+// Impor kembali 'publishMqttMessage' dari mqtt_service
+const { 
+  isDeviceConfirmed, 
+  confirmDeviceClaim,
+  unclaimedDevices,
+  publishMqttMessage
+} = require('../services/mqtt_service');
+// =======================================================================
+
+
+// FUNGSI BARU: Untuk mengecek status klaim
+const getClaimStatus = asyncHandler(async (req, res) => {
+  let confirmedDeviceId = null;
+  for (const [deviceId, status] of unclaimedDevices.entries()) {
+    if (status.confirmed) {
+      confirmedDeviceId = deviceId;
+      break; 
     }
+  }
 
-    // --- Validasi di Dunia Nyata ---
-    // Di sini, Anda akan memvalidasi secretKey ke database registri pabrik.
-    // Untuk TA, kita asumsikan kuncinya benar dan hanya cek duplikasi.
-    // PENTING: Pastikan secretKey yang dikirim sama dengan yang di-flash ke firmware.
-
-    const existingDevice = await Device.findOne({ deviceId });
-    if (existingDevice) {
-        res.status(400);
-        throw new Error('Perangkat ini sudah terdaftar di akun lain.');
-    }
-
-    const newDevice = new Device({
-        owner: req.user._id,
-        deviceId: deviceId,
-        name: `DigiPlug ${deviceId.slice(-4)}`, // Nama default
-        type: 'plug',
-    });
-
-    const createdDevice = await newDevice.save();
-    console.log(`[API] Perangkat ${deviceId} berhasil diklaim oleh user ${req.user._id}`);
-    res.status(201).json(createdDevice);
+  if (confirmedDeviceId) {
+    res.status(200).json({ status: 'ready', deviceId: confirmedDeviceId });
+  } else {
+    res.status(202).json({ status: 'waiting' }); 
+  }
 });
 
+const claimDevice = asyncHandler(async (req, res) => {
+  const { deviceId } = req.body;
+  if (!deviceId) {
+    res.status(400);
+    throw new Error('deviceId diperlukan.');
+  }
 
-// @desc    Update a device owned by the user
+  const existingDevice = await Device.findOne({ deviceId });
+  if (existingDevice) {
+    confirmDeviceClaim(deviceId); 
+    res.status(400);
+    throw new Error('Perangkat ini sudah terdaftar di sistem.');
+  }
+
+  if (!isDeviceConfirmed(deviceId)) {
+    res.status(404);
+    throw new Error('Perangkat belum dikonfirmasi secara fisik. Tekan tombol pada perangkat.');
+  }
+  
+  const newDevice = new Device({
+    owner: req.user._id,
+    deviceId: deviceId,
+    name: `DigiPlug ${deviceId.slice(-6)}`,
+    type: 'plug',
+  });
+
+  const createdDevice = await newDevice.save();
+  confirmDeviceClaim(deviceId);
+  res.status(201).json(createdDevice); 
+});
+
+const getDevices = asyncHandler(async (req, res) => {
+  const devices = await Device.find({ owner: req.user.id });
+  res.json(devices);
+});
+
 const updateDevice = asyncHandler(async (req, res) => {
   const device = await Device.findById(req.params.id);
-  if (device && device.owner.toString() === req.user._id.toString()) {
+
+  if (device && device.owner.toString() === req.user.id.toString()) {
     const wasActive = device.active;
-    Object.assign(device, req.body);
-    const updatedDevice = await device.save();
-    if (wasActive !== updatedDevice.active) {
-        const topic = `digihome/devices/${updatedDevice.deviceId}/command`;
-        const message = { action: "SET_STATUS", payload: updatedDevice.active ? "ON" : "OFF" };
-        publishMqttMessage(topic, message);
+    
+    // Perbarui nama, ruangan, atau status 'active' dari body request
+    device.name = req.body.name || device.name;
+    device.room = req.body.room || device.room;
+    if (typeof req.body.active === 'boolean') {
+      device.active = req.body.active;
     }
+
+    const updatedDevice = await device.save();
+
+    // ======================= PERBAIKAN UTAMA DI SINI =======================
+    // Jika status 'active' (ON/OFF) berubah, kirim perintah MQTT
+    // Pastikan kode ini tidak dikomentari lagi
+    if (wasActive !== updatedDevice.active) {
+      const topic = `digihome/devices/${updatedDevice.deviceId}/command`;
+      const message = { action: "SET_STATUS", payload: updatedDevice.active ? "ON" : "OFF" };
+      publishMqttMessage(topic, message);
+    }
+    // =======================================================================
+    
     res.json(updatedDevice);
   } else {
     res.status(404);
@@ -455,48 +495,68 @@ const updateDevice = asyncHandler(async (req, res) => {
   }
 });
 
-
-// @desc    Delete a device and trigger factory reset
 const deleteDevice = asyncHandler(async (req, res) => {
   const device = await Device.findById(req.params.id);
-  if (device && device.owner.toString() === req.user._id.toString()) {
+  if (device && device.owner.toString() === req.user.id.toString()) {
     const topic = `digihome/devices/${device.deviceId}/command`;
     publishMqttMessage(topic, { action: "FACTORY_RESET" });
     await device.deleteOne();
-    await Schedule.deleteMany({ deviceId: device.deviceId, owner: req.user._id });
     res.json({ message: 'Perangkat berhasil dihapus dari akun dan direset.' });
   } else {
     res.status(404);
     throw new Error('Perangkat tidak ditemukan atau Anda tidak berwenang');
   }
 });
+const setDeviceConfig = asyncHandler(async (req, res) => {
+  const { configKey, value } = req.body;
+  const device = await Device.findById(req.params.id);
 
+  if (device && device.owner.toString() === req.user.id.toString()) {
+    // Validasi input
+    if (configKey === 'overcurrentThreshold' && typeof value === 'number' && value > 0) {
+      // Update di database
+      device.config.overcurrentThreshold = value;
+      await device.save();
+      
+      // Kirim perintah ke perangkat via MQTT
+      const topic = `digihome/devices/${device.deviceId}/command`;
+      const message = {
+        action: "SET_CONFIG",
+        payload: { [configKey]: value }
+      };
+      publishMqttMessage(topic, message);
 
-const getDevices = asyncHandler(async (req, res) => {
-    const devices = await Device.find({ owner: req.user._id });
-    res.json(devices);
+      res.status(200).json({ message: `Konfigurasi ${configKey} berhasil diperbarui.`});
+    } else {
+      res.status(400).send({ message: 'Kunci konfigurasi atau nilai tidak valid.' });
+    }
+  } else {
+    res.status(404).send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
+  }
 });
 
-// Fungsi addDevice yang lama sudah tidak relevan karena sekarang menggunakan claimDevice
-// Namun kita biarkan untuk potensi penggunaan lain atau debugging.
-const addDevice = asyncHandler(async (req, res) => {
-    const { deviceId, name, type } = req.body;
-    const newDevice = new Device({
-        deviceId, name, type, owner: req.user._id
-    });
-    const createdDevice = await newDevice.save();
-    res.status(201).json(createdDevice);
+// --- FUNGSI BARU: Untuk memerintahkan perangkat masuk mode pairing ---
+const enterReProvisioningMode = asyncHandler(async (req, res) => {
+  const device = await Device.findById(req.params.id);
+  if (device && device.owner.toString() === req.user.id.toString()) {
+    const topic = `digihome/devices/${device.deviceId}/command`;
+    const message = { action: "ENTER_PROVISIONING" };
+    publishMqttMessage(topic, message);
+    res.status(200).json({ message: 'Perintah re-provisioning terkirim.' });
+  } else {
+    res.status(404).send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
+  }
 });
 
-
-module.exports = { 
+module.exports = {
   getDevices,
-  claimDevice, 
+  claimDevice,
   updateDevice,
   deleteDevice,
-  addDevice
-};
-\`\`\`
+  getClaimStatus,
+  setDeviceConfig, 
+  enterReProvisioningMode, 
+};\`\`\`
 .
 .
 ## File powerLogController.js
@@ -911,36 +971,38 @@ const notFound = (req, res, next) => {
 _Path: relPath:~=~_
 .
 \`\`\`javascript
-// models/Device.js
-
 const mongoose = require('mongoose');
-// Hapus dependensi ke mqtt_service untuk memutus siklus
-// const { publishMqttMessage } = require('../services/mqtt_service'); 
 
 const deviceSchema = new mongoose.Schema(
   {
     owner: { type: mongoose.Schema.Types.ObjectId, required: true, ref: 'User' },
-    deviceId: { type: String, required: true },
+    deviceId: { type: String, required: true, unique: true },
     name: { type: String, required: true },
     type: { type: String, required: true },
     room: { type: String, default: 'Unassigned' },
     active: { type: Boolean, default: false },
     isFavorite: { type: Boolean, default: false },
     attributes: { type: mongoose.Schema.Types.Mixed, default: {} },
+    
+    // --- PENAMBAHAN BARU ---
+    isOnline: { type: Boolean, default: false },
+    wifiSsid: { type: String, default: 'N/A' },
+    wifiRssi: { type: Number, default: 0 },
+    config: {
+      overcurrentThreshold: { type: Number, default: 5.0 }
+    }
+    // ----------------------
   },
   {
     timestamps: true,
-    indexes: [{ fields: { owner: 1, deviceId: 1 }, unique: true }],
   }
 );
 
-// --- PERBAIKAN: Hapus hook 'pre' atau 'post' dari sini ---
-// Logika pengiriman MQTT akan dipindahkan ke controller.
-// Ini membuat model lebih bersih dan fokus pada struktur data saja.
+// Hapus index lama jika ada, dan pastikan deviceId unik
+// deviceSchema.index({ owner: 1, deviceId: 1 }, { unique: true }); // Ini bagus, tapi deviceId sendiri harus unik di seluruh sistem
 
 const Device = mongoose.model('Device', deviceSchema);
-module.exports = Device;
-\`\`\`
+module.exports = Device;\`\`\`
 .
 .
 ## File PowerLog.js
@@ -1093,31 +1155,31 @@ module.exports = User;
 _Path: relPath:~=~_
 .
 \`\`\`javascript
-// routes/deviceRoutes.js
-
 const express = require('express');
 const router = express.Router();
-const { 
-    getDevices,
-    claimDevice,
-    updateDevice, 
-    deleteDevice,
-    addDevice // Tetap ekspor untuk kompatibilitas
+
+const {
+  getDevices,
+  claimDevice,
+  updateDevice,
+  deleteDevice,
+  getClaimStatus,
+  setDeviceConfig, // Impor fungsi baru
+  enterReProvisioningMode, // Impor fungsi baru
 } = require('../controllers/deviceController');
 const { protect } = require('../middleware/authMiddleware');
 
-router.route('/')
-    .get(protect, getDevices)
-    .post(protect, addDevice); // Route POST lama tetap ada
+router.route('/').get(protect, getDevices);
+router.route('/claim-status').get(protect, getClaimStatus);
+router.route('/claim').post(protect, claimDevice);
+router.route('/:id').put(protect, updateDevice).delete(protect, deleteDevice);
 
-router.route('/claim').post(protect, claimDevice); // Route baru untuk klaim
+// --- PENAMBAHAN RUTE BARU ---
+router.route('/:id/config').put(protect, setDeviceConfig);
+router.route('/:id/re-provision').post(protect, enterReProvisioningMode);
+// ----------------------------
 
-router.route('/:id')
-    .put(protect, updateDevice)
-    .delete(protect, deleteDevice);
-
-module.exports = router;
-\`\`\`
+module.exports = router;\`\`\`
 .
 .
 ## File powerLogRoutes.js
@@ -1215,94 +1277,152 @@ _Path: relPath:~=~_
 const mqtt = require('mqtt');
 const PowerLog = require('../models/PowerLog');
 const Device = require('../models/Device');
-const { WebSocket } = require('ws');
 
 let client = null;
 
-/**
- * Menghubungkan ke MQTT broker dan mengatur listener.
- * @param {Map<string, WebSocket>} clientConnections Peta koneksi WebSocket pengguna.
- */
+// --- STATE MANAGEMENT UNTUK CLAIMING ---
+// Struktur: Map<deviceId, { confirmed: boolean }>
+const unclaimedDevices = new Map();
+const unclaimedDeviceTimers = new Map();
+
+// --- LOGIKA BATCH PROCESSING UNTUK TELEMETRI ---
+const telemetryBuffer = new Map();
+const BATCH_INTERVAL_MS = 5 * 60 * 1000;
+
+async function processTelemetryBuffer() {
+  if (telemetryBuffer.size === 0) return;
+  console.log(`[Batch] Memproses buffer telemetri untuk ${telemetryBuffer.size} perangkat...`);
+  const logsToInsert = [];
+  for (const [deviceId, messages] of telemetryBuffer.entries()) {
+    if (messages.length === 0) continue;
+    const avgVoltage = messages.reduce((sum, msg) => sum + (msg.voltage || 0), 0) / messages.length;
+    const avgCurrent = messages.reduce((sum, msg) => sum + (msg.current || 0), 0) / messages.length;
+    const avgPower = messages.reduce((sum, msg) => sum + (msg.power || 0), 0) / messages.length;
+    const avgPowerFactor = messages.reduce((sum, msg) => sum + (msg.powerFactor || 0), 0) / messages.length;
+    const lastEnergyKWh = messages.length > 0 ? messages[messages.length - 1].energyKWh : 0;
+    logsToInsert.push({
+      deviceId, timestamp: new Date(), voltage: avgVoltage, current: avgCurrent,
+      power: avgPower, energyKWh: lastEnergyKWh, powerFactor: avgPowerFactor,
+    });
+  }
+  try {
+    if (logsToInsert.length > 0) {
+      await PowerLog.insertMany(logsToInsert);
+      console.log(`[Batch] Berhasil menyimpan ${logsToInsert.length} log agregat.`);
+    }
+  } catch (error) {
+    console.error('[Batch] Gagal menyimpan data batch:', error);
+  }
+  telemetryBuffer.clear();
+}
+
+setInterval(processTelemetryBuffer, BATCH_INTERVAL_MS);
+
+// --- FUNGSI HELPER YANG DIEKSPOR ---
+const isDeviceConfirmed = (deviceId) => unclaimedDevices.has(deviceId) && unclaimedDevices.get(deviceId).confirmed === true;
+const confirmDeviceClaim = (deviceId) => {
+  unclaimedDevices.delete(deviceId);
+  if (unclaimedDeviceTimers.has(deviceId)) {
+    clearTimeout(unclaimedDeviceTimers.get(deviceId));
+    unclaimedDeviceTimers.delete(deviceId);
+  }
+  console.log(`[Claim] Perangkat ${deviceId} berhasil diklaim.`);
+};
+
+// --- FUNGSI KONEKSI UTAMA ---
 const connectMqtt = (clientConnections) => {
   let brokerUrl = process.env.MQTT_BROKER_URL;
-  if (!brokerUrl) {
-    console.error("[MQTT] Error: MQTT_BROKER_URL tidak terdefinisi.");
-    return;
-  }
-  if (!/^(mqtt|mqtts|ws|wss):\/\//.test(brokerUrl)) {
-    brokerUrl = `mqtt://${brokerUrl}`;
-  }
+  if (!brokerUrl) { return console.error("[MQTT] Error: MQTT_BROKER_URL tidak terdefinisi."); }
+  if (!/^(mqtt|mqtts|ws|wss):\/\//.test(brokerUrl)) { brokerUrl = `mqtt://${brokerUrl}`; }
 
-  const options = {
-    clientId: `digihome_backend_${Math.random().toString(16).slice(2, 8)}`,
-    username: process.env.MQTT_USERNAME,
-    password: process.env.MQTT_PASSWORD,
-  };
-  
-  console.log(`[MQTT] Menghubungkan ke broker di ${brokerUrl}...`);
+  const options = { clientId: `digihome_backend_${Math.random().toString(16).slice(2, 8)}` };
   client = mqtt.connect(brokerUrl, options);
 
   client.on('connect', () => {
     console.log('[MQTT] Berhasil terhubung ke broker.');
-    const telemetryTopic = 'digihome/devices/+/telemetry';
-    client.subscribe(telemetryTopic, (err) => {
-      if (!err) {
-        console.log(`[MQTT] Berlangganan ke topik: ${telemetryTopic}`);
-      }
+    client.subscribe('digihome/#', { qos: 1 }, (err) => {
+      if (!err) console.log('[MQTT] Berlangganan ke topik generik: digihome/#');
     });
   });
 
   client.on('message', async (topic, payload) => {
+    console.log(`[MQTT] Pesan diterima di topik [${topic}]`);
+    let message;
     try {
-      if (!topic.includes('/telemetry')) return;
+      message = JSON.parse(payload.toString());
+    } catch (error) {
+      console.error(`[MQTT] Gagal parse JSON dari topik ${topic}:`, payload.toString());
+      return;
+    }
 
-      const message = JSON.parse(payload.toString());
-      const { deviceId } = message;
+    // --- PERBAIKAN: Selalu gunakan deviceId dari payload untuk konsistensi ---
+    const { deviceId } = message;
+    if (!deviceId) {
+      console.warn(`[MQTT] Menerima pesan tanpa deviceId di topik ${topic}`);
+      return;
+    }
 
-      if (!deviceId) return;
+    try {
+      const topicType = topic.split('/')[1]; // 'provisioning', 'devices'
 
-      const newLog = new PowerLog(message);
-      const savedLog = await newLog.save();
-      
-      const device = await Device.findOne({ deviceId: deviceId });
-      if (!device) return;
-
-      const ownerSocket = clientConnections.get(device.owner.toString());
-      if (ownerSocket && ownerSocket.readyState === WebSocket.OPEN) {
-        ownerSocket.send(JSON.stringify(savedLog));
+      if (topicType === 'provisioning') {
+        if (topic.endsWith('/online')) {
+          console.log(`[Provisioning] Perangkat ${deviceId} online, menunggu konfirmasi fisik.`);
+          unclaimedDevices.set(deviceId, { confirmed: false });
+          const timer = setTimeout(() => {
+            if (unclaimedDevices.has(deviceId)) {
+                unclaimedDevices.delete(deviceId);
+                unclaimedDeviceTimers.delete(deviceId);
+                console.log(`[Provisioning] Batas waktu klaim untuk ${deviceId} habis.`);
+            }
+          }, 5 * 60 * 1000);
+          unclaimedDeviceTimers.set(deviceId, timer);
+        } else if (topic.endsWith('/confirm')) {
+          if (unclaimedDevices.has(deviceId)) {
+            unclaimedDevices.set(deviceId, { confirmed: true });
+            console.log(`[Provisioning] Konfirmasi fisik untuk ${deviceId} DITERIMA & STATUS DIPERBARUI.`);
+            console.log('[Provisioning] Status daftar tunggu saat ini:', Array.from(unclaimedDevices.entries()));
+          }
+        }
+      } else if (topicType === 'devices') {
+        if (topic.endsWith('/status')) {
+          await Device.findOneAndUpdate({ deviceId }, { isOnline: message.isOnline }, { new: true });
+        } else if (topic.endsWith('/telemetry')) {
+          const device = await Device.findOne({ deviceId });
+          if (device) {
+            // Update status WiFi
+            await device.updateOne({ wifiSsid: message.wifiSsid, wifiRssi: message.wifiRssi, isOnline: true });
+            // Teruskan ke WebSocket
+            if (device.owner) {
+              const ownerSocket = clientConnections.get(device.owner.toString());
+              if (ownerSocket && ownerSocket.readyState === 1) { 
+                  ownerSocket.send(payload.toString());
+              }
+            }
+          }
+          // Simpan ke buffer
+          if (!telemetryBuffer.has(deviceId)) telemetryBuffer.set(deviceId, []);
+          telemetryBuffer.get(deviceId).push(message);
+        }
       }
     } catch (error) {
-      console.error('[MQTT] Gagal memproses pesan telemetri:', error.message);
+      console.error(`[MQTT] Gagal memproses pesan dari topik ${topic}:`, error.message);
     }
   });
 
   client.on('error', (error) => console.error('[MQTT] Error koneksi:', error));
-  client.on('reconnect', () => console.log('[MQTT] Menyambung ulang...'));
-  client.on('close', () => console.log('[MQTT] Koneksi MQTT ditutup.'));
 };
 
-/**
- * Menerbitkan (publish) pesan ke topik MQTT.
- * @param {string} topic - Topik tujuan.
- * @param {object|string} message - Pesan yang akan dikirim.
- */
 const publishMqttMessage = (topic, message) => {
-    // --- PERBAIKAN: Implementasi lengkap fungsi publish ---
-    if (client && client.connected) {
-        const payload = typeof message === 'string' ? message : JSON.stringify(message);
-        client.publish(topic, payload, (err) => {
-            if (err) {
-                console.error(`[MQTT] Gagal publish ke topik ${topic}:`, err);
-            } else {
-                console.log(`[MQTT] Publish ke ${topic}: ${payload}`);
-            }
-        });
-    } else {
-        console.error('[MQTT] Tidak bisa publish. Klien tidak terhubung.');
-    }
+  if (client && client.connected) {
+      const payload = JSON.stringify(message);
+      client.publish(topic, payload);
+  } else {
+      console.error('[MQTT] Tidak bisa publish. Klien tidak terhubung.');
+  }
 };
 
-module.exports = { connectMqtt, publishMqttMessage };
+module.exports = { connectMqtt, publishMqttMessage, isDeviceConfirmed, confirmDeviceClaim, unclaimedDevices };
 \`\`\`
 .
 .

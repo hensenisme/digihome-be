@@ -9,7 +9,7 @@ const {
   isDeviceConfirmed, 
   confirmDeviceClaim,
   unclaimedDevices,
-  publishMqttMessage // <-- Impor fungsi yang hilang
+  publishMqttMessage
 } = require('../services/mqtt_service');
 // =======================================================================
 
@@ -111,6 +111,46 @@ const deleteDevice = asyncHandler(async (req, res) => {
     throw new Error('Perangkat tidak ditemukan atau Anda tidak berwenang');
   }
 });
+const setDeviceConfig = asyncHandler(async (req, res) => {
+  const { configKey, value } = req.body;
+  const device = await Device.findById(req.params.id);
+
+  if (device && device.owner.toString() === req.user.id.toString()) {
+    // Validasi input
+    if (configKey === 'overcurrentThreshold' && typeof value === 'number' && value > 0) {
+      // Update di database
+      device.config.overcurrentThreshold = value;
+      await device.save();
+      
+      // Kirim perintah ke perangkat via MQTT
+      const topic = `digihome/devices/${device.deviceId}/command`;
+      const message = {
+        action: "SET_CONFIG",
+        payload: { [configKey]: value }
+      };
+      publishMqttMessage(topic, message);
+
+      res.status(200).json({ message: `Konfigurasi ${configKey} berhasil diperbarui.`});
+    } else {
+      res.status(400).send({ message: 'Kunci konfigurasi atau nilai tidak valid.' });
+    }
+  } else {
+    res.status(404).send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
+  }
+});
+
+// --- FUNGSI BARU: Untuk memerintahkan perangkat masuk mode pairing ---
+const enterReProvisioningMode = asyncHandler(async (req, res) => {
+  const device = await Device.findById(req.params.id);
+  if (device && device.owner.toString() === req.user.id.toString()) {
+    const topic = `digihome/devices/${device.deviceId}/command`;
+    const message = { action: "ENTER_PROVISIONING" };
+    publishMqttMessage(topic, message);
+    res.status(200).json({ message: 'Perintah re-provisioning terkirim.' });
+  } else {
+    res.status(404).send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
+  }
+});
 
 module.exports = {
   getDevices,
@@ -118,4 +158,6 @@ module.exports = {
   updateDevice,
   deleteDevice,
   getClaimStatus,
+  setDeviceConfig, 
+  enterReProvisioningMode, 
 };
