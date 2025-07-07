@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="id">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>DigiHome - Flowchart Visualizer</title>
+        <!-- Memuat Tailwind CSS untuk styling yang modern dan bersih -->
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+        /* Menggunakan font Inter untuk tampilan yang bersih dan modern */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Style untuk menyembunyikan tombol saat mencetak */
+        @media print {
+            .no-print {
+                display: none;
+            }
+            body {
+                -webkit-print-color-adjust: exact; /* Memastikan warna dan background tercetak di Chrome */
+                print-color-adjust: exact;
+            }
+        }
+    </style>
+    </head>
+    <body class="bg-gray-50 text-gray-800 p-4 sm:p-8">
+
+        <div class="max-w-4xl mx-auto bg-white p-6 sm:p-8 rounded-xl shadow-lg">
+
+            <!-- Header Halaman -->
+            <div class="text-center mb-8 no-print">
+                <h1 class="text-3xl font-bold text-blue-600">DigiHome System
+                    Flowchart</h1>
+                <p class="text-gray-600 mt-2">Diagram Alir Operasional Perangkat
+                    Keras dan Aplikasi</p>
+                <div class="mt-4 border-t pt-4">
+                    <p class="text-sm text-gray-500">
+                        <strong>Cara Penggunaan:</strong> Gunakan tombol
+                        "Cetak ke PDF" untuk menyimpan flowchart sebagai file
+                        PDF, atau ambil tangkapan layar (screenshot) untuk
+                        mendapatkan file gambar.
+                    </p>
+                    <button onclick="window.print()"
+                        class="mt-4 bg-blue-600 text-white font-bold py-2 px-6 rounded-lg hover:bg-blue-700 transition-colors">
+                        Cetak ke PDF
+                    </button>
+                </div>
+            </div>
+
+            <!-- Flowchart Perangkat Keras -->
+            <div class="mb-12">
+                <h2
+                    class="text-2xl font-semibold text-gray-700 border-b-2 border-blue-200 pb-2 mb-4">1.
+                    Flowchart Perangkat Keras (Firmware Digi-Plug)</h2>
+                <p class="text-gray-600 mb-6">Diagram ini menjelaskan alur
+                    logika yang berjalan di dalam mikrokontroler ESP32, mulai
+                    dari inisialisasi hingga loop operasional utama yang
+                    menangani pembacaan sensor, kontrol, dan komunikasi.</p>
+                <div class="flex justify-center p-4 bg-gray-100 rounded-lg">
+                    <div class="mermaid">
+                        graph TD
+                        A[Mulai] --> B{Inisialisasi Perangkat Keras<br>Pin,
+                        Sensor, WiFi, LittleFS}
+                        B --> C{Memuat Konfigurasi<br>Ambang Batas Arus dari
+                        NVS}
+                        C --> D{Cek Koneksi WiFi}
+                        D -- Tersambung --> F{Hubungkan ke Broker MQTT}
+                        D -- Gagal Tersambung --> E[Masuk Mode Provisioning BLE]
+                        E --> D
+                        F -- Gagal --> G[Coba Hubungkan Kembali MQTT]
+                        F -- Berhasil --> H[Sinkronisasi Data Offline<br>Kirim
+                        data dari LittleFS jika ada]
+                        G --> I
+                        H --> I[Loop Operasional Utama]
+
+                        subgraph Loop Operasional Utama
+                        I --> J{Baca Data Sensor PZEM-004T}
+                        J --> K{Arus Melebihi Ambang Batas?}
+                        K -- Ya --> L[Matikan Relay & Kirim Peringatan]
+                        K -- Tidak --> M{Cek Tombol Fisik}
+                        L --> M
+                        M -- "Tekan Singkat" --> N[Toggle Status Relay<br>Kirim
+                        Telemetri Segera]
+                        M -- "Tekan Lama 5s" --> O[Mulai Factory Reset]
+                        M -- "Tidak Ditekan" --> P{Koneksi MQTT Aktif?}
+                        N --> P
+                        P -- Ya --> Q[Kirim Data Telemetri ke Server]
+                        P -- Tidak --> R[Simpan Data Telemetri ke LittleFS]
+                        Q --> S{Ada Perintah Masuk dari MQTT?}
+                        R --> S
+                        S -- Ya --> T[Eksekusi Perintah<br>Ubah Status atau
+                        Konfigurasi]
+                        S -- Tidak --> I
+                        T --> I
+                        end
+                    </div>
+                </div>
+            </div>
+
+            <!-- Flowchart Aplikasi Mobile -->
+            <div>
+                <h2
+                    class="text-2xl font-semibold text-gray-700 border-b-2 border-blue-200 pb-2 mb-4">2.
+                    Flowchart Aplikasi Mobile (DigiHome App)</h2>
+                <p class="text-gray-600 mb-6">Diagram ini menggambarkan alur
+                    interaksi pengguna dengan aplikasi, mulai dari proses
+                    autentikasi hingga melakukan kontrol dan monitoring
+                    perangkat.</p>
+                <div class="flex justify-center p-4 bg-gray-100 rounded-lg">
+                    <div class="mermaid">
+                        graph TD
+                        A[Mulai Aplikasi] --> B{Splash Screen<br>Cek Token Login
+                        Tersimpan}
+                        B -- "Token Ada" --> C[Hubungkan ke WebSocket dan
+                        Sinkronisasi Data]
+                        B -- "Token Tidak Ada" --> D[Tampilkan Halaman Login]
+                        D --> E{Pengguna Masukkan Kredensial}
+                        E -- "Gagal" --> F[Tampilkan Pesan Error]
+                        F --> D
+                        E -- "Berhasil" --> G[Simpan Token dan Kirim FCM Token
+                        ke Backend]
+                        G --> C
+                        C --> H[Tampilkan Halaman Utama Dashboard]
+
+                        subgraph "Interaksi di Halaman Utama"
+                        H --> I{Pilih Menu}
+                        I -- "Kontrol Perangkat" --> J[Kirim Perintah ON/OFF via
+                        API]
+                        J --> K[Backend Kirim Perintah via MQTT]
+                        K --> L{UI Menunggu Konfirmasi Status dari WebSocket}
+                        L --> H
+                        I -- "Tambah Perangkat" --> M[Mulai Alur
+                        Provisioning<br>Pindai QR atau BLE]
+                        M --> N[Kirim Kredensial WiFi dan Lakukan Klaim
+                        Perangkat]
+                        N --> H
+                        I -- "Lihat Statistik" --> O[Tampilkan Halaman
+                        Statistik]
+                        O --> H
+                        end
+                    </div>
+                </div>
+            </div>
+
+            <!-- Area untuk menampilkan log kesalahan -->
+            <div id="log-container" class="mt-8 no-print"
+                style="display: none;">
+                <h3 class="text-xl font-semibold text-red-600">Log Kesalahan
+                    Mermaid</h3>
+                <pre id="log-output"
+                    class="bg-red-50 text-red-800 p-4 rounded-lg mt-2 whitespace-pre-wrap font-mono text-sm"></pre>
+            </div>
+
+        </div>
+
+        <!-- Memuat pustaka Mermaid.js untuk merender diagram -->
+        <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        
+        try {
+            // Inisialisasi Mermaid.js
+            await mermaid.run({
+                querySelector: '.mermaid',
+            });
+        } catch (error) {
+            // Jika terjadi error, tampilkan di halaman dan di console
+            console.error("Mermaid.js rendering error:", error);
+            const logContainer = document.getElementById('log-container');
+            const logOutput = document.getElementById('log-output');
+            if (logContainer && logOutput) {
+                logContainer.style.display = 'block';
+                logOutput.textContent = error.str || error.message;
+            }
+        }
+    </script>
+
+    </body>
+</html>

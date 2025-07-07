@@ -13,10 +13,11 @@
     "bcryptjs": "^3.0.2",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
+    "firebase-admin": "^13.4.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.16.0",
-    "ws": "^8.18.2",
+    "mqtt": "^5.7.0",
     "node-cron": "^3.0.3",
-    "mqtt": "^5.7.0"
+    "ws": "^8.18.2"
   }
 }

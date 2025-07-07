@@ -94,6 +94,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 const jwt = require('jsonwebtoken');
+const notificationRoutes = require('./routes/notificationRoutes');
 
 const connectDB = require('./config/db');
 const { connectMqtt } = require('./services/mqtt_service');
@@ -106,6 +107,7 @@ const deviceRoutes = require('./routes/deviceRoutes');
 const userRoutes = require('./routes/userRoutes');
 const roomRoutes = require('./routes/roomRoutes');
 const scheduleRoutes = require('./routes/scheduleRoutes');
+
 
 dotenv.config();
 
@@ -152,10 +154,11 @@ app.use('/api/devices', deviceRoutes);
 app.use('/api/rooms', roomRoutes);
 app.use('/api/logs', powerLogRoutes);
 app.use('/api/schedules', scheduleRoutes);
-
+app.use('/api/notifications', notificationRoutes);
 // Error Middleware
 app.use(notFound);
 app.use(errorHandler);
+
 
 const PORT = process.env.PORT || 5000;
 
@@ -399,34 +402,36 @@ _Path: relPath:~=~_
 const Device = require('../models/Device');
 const asyncHandler = require('../middleware/asyncHandler');
 
-// ======================= PERBAIKAN UTAMA DI SINI =======================
-// Impor kembali 'publishMqttMessage' dari mqtt_service
-const { 
-  isDeviceConfirmed, 
+// Impor fungsi-fungsi yang dibutuhkan dari service MQTT
+const {
+  isDeviceConfirmed,
   confirmDeviceClaim,
   unclaimedDevices,
-  publishMqttMessage
+  publishMqttMessage,
 } = require('../services/mqtt_service');
-// =======================================================================
 
-
-// FUNGSI BARU: Untuk mengecek status klaim
+// @desc    Get claim status for a new device
+// @route   GET /api/devices/claim-status
+// @access  Private
 const getClaimStatus = asyncHandler(async (req, res) => {
   let confirmedDeviceId = null;
   for (const [deviceId, status] of unclaimedDevices.entries()) {
     if (status.confirmed) {
       confirmedDeviceId = deviceId;
-      break; 
+      break;
     }
   }
 
   if (confirmedDeviceId) {
     res.status(200).json({ status: 'ready', deviceId: confirmedDeviceId });
   } else {
-    res.status(202).json({ status: 'waiting' }); 
+    res.status(202).json({ status: 'waiting' });
   }
 });
 
+// @desc    Claim a new device for a user
+// @route   POST /api/devices/claim
+// @access  Private
 const claimDevice = asyncHandler(async (req, res) => {
   const { deviceId } = req.body;
   if (!deviceId) {
@@ -436,18 +441,20 @@ const claimDevice = asyncHandler(async (req, res) => {
 
   const existingDevice = await Device.findOne({ deviceId });
   if (existingDevice) {
-    confirmDeviceClaim(deviceId); 
+    confirmDeviceClaim(deviceId);
     res.status(400);
     throw new Error('Perangkat ini sudah terdaftar di sistem.');
   }
 
   if (!isDeviceConfirmed(deviceId)) {
     res.status(404);
-    throw new Error('Perangkat belum dikonfirmasi secara fisik. Tekan tombol pada perangkat.');
+    throw new Error(
+      'Perangkat belum dikonfirmasi secara fisik. Tekan tombol pada perangkat.'
+    );
   }
-  
+
   const newDevice = new Device({
-    owner: req.user._id,
+    owner: req.user.id,
     deviceId: deviceId,
     name: `DigiPlug ${deviceId.slice(-6)}`,
     type: 'plug',
@@ -455,39 +462,58 @@ const claimDevice = asyncHandler(async (req, res) => {
 
   const createdDevice = await newDevice.save();
   confirmDeviceClaim(deviceId);
-  res.status(201).json(createdDevice); 
+  res.status(201).json(createdDevice);
 });
 
+// @desc    Get all devices for a logged-in user
+// @route   GET /api/devices
+// @access  Private
 const getDevices = asyncHandler(async (req, res) => {
   const devices = await Device.find({ owner: req.user.id });
   res.json(devices);
 });
 
+// @desc    Update a device's properties (name, room, favorite, active)
+// @route   PUT /api/devices/:id
+// @access  Private
 const updateDevice = asyncHandler(async (req, res) => {
   const device = await Device.findById(req.params.id);
 
   if (device && device.owner.toString() === req.user.id.toString()) {
     const wasActive = device.active;
-    
-    // Perbarui nama, ruangan, atau status 'active' dari body request
+
+    // Perbarui nama dan ruangan jika ada di body request
     device.name = req.body.name || device.name;
     device.room = req.body.room || device.room;
+
+    // =================================================================
+    // ================== SOLUSI MASALAH FAVORIT ADA DI SINI ==================
+    // Tambahkan blok ini untuk menangani pembaruan field 'isFavorite'.
+    // Kode ini akan memeriksa apakah ada data 'isFavorite' di dalam request,
+    // dan jika ada, akan memperbarui nilainya di database.
+    if (typeof req.body.isFavorite === 'boolean') {
+      device.isFavorite = req.body.isFavorite;
+    }
+    // =================================================================
+    // =================================================================
+
+    // Perbarui status aktif (ON/OFF)
     if (typeof req.body.active === 'boolean') {
       device.active = req.body.active;
     }
 
     const updatedDevice = await device.save();
 
-    // ======================= PERBAIKAN UTAMA DI SINI =======================
-    // Jika status 'active' (ON/OFF) berubah, kirim perintah MQTT
-    // Pastikan kode ini tidak dikomentari lagi
+    // Jika status 'active' berubah, kirim perintah MQTT ke perangkat
     if (wasActive !== updatedDevice.active) {
       const topic = `digihome/devices/${updatedDevice.deviceId}/command`;
-      const message = { action: "SET_STATUS", payload: updatedDevice.active ? "ON" : "OFF" };
+      const message = {
+        action: 'SET_STATUS',
+        payload: updatedDevice.active ? 'ON' : 'OFF',
+      };
       publishMqttMessage(topic, message);
     }
-    // =======================================================================
-    
+
     res.json(updatedDevice);
   } else {
     res.status(404);
@@ -495,11 +521,15 @@ const updateDevice = asyncHandler(async (req, res) => {
   }
 });
 
+// @desc    Delete a device
+// @route   DELETE /api/devices/:id
+// @access  Private
 const deleteDevice = asyncHandler(async (req, res) => {
   const device = await Device.findById(req.params.id);
+
   if (device && device.owner.toString() === req.user.id.toString()) {
     const topic = `digihome/devices/${device.deviceId}/command`;
-    publishMqttMessage(topic, { action: "FACTORY_RESET" });
+    publishMqttMessage(topic, { action: 'FACTORY_RESET' });
     await device.deleteOne();
     res.json({ message: 'Perangkat berhasil dihapus dari akun dan direset.' });
   } else {
@@ -507,44 +537,60 @@ const deleteDevice = asyncHandler(async (req, res) => {
     throw new Error('Perangkat tidak ditemukan atau Anda tidak berwenang');
   }
 });
+
+// @desc    Update a device's specific configuration
+// @route   PUT /api/devices/:id/config
+// @access  Private
 const setDeviceConfig = asyncHandler(async (req, res) => {
   const { configKey, value } = req.body;
   const device = await Device.findById(req.params.id);
 
   if (device && device.owner.toString() === req.user.id.toString()) {
-    // Validasi input
-    if (configKey === 'overcurrentThreshold' && typeof value === 'number' && value > 0) {
-      // Update di database
+    if (
+      configKey === 'overcurrentThreshold' &&
+      typeof value === 'number' &&
+      value > 0
+    ) {
       device.config.overcurrentThreshold = value;
       await device.save();
-      
-      // Kirim perintah ke perangkat via MQTT
+
       const topic = `digihome/devices/${device.deviceId}/command`;
       const message = {
-        action: "SET_CONFIG",
-        payload: { [configKey]: value }
+        action: 'SET_CONFIG',
+        payload: { [configKey]: value },
       };
       publishMqttMessage(topic, message);
 
-      res.status(200).json({ message: `Konfigurasi ${configKey} berhasil diperbarui.`});
+      res
+        .status(200)
+        .json({ message: `Konfigurasi ${configKey} berhasil diperbarui.` });
     } else {
-      res.status(400).send({ message: 'Kunci konfigurasi atau nilai tidak valid.' });
+      res
+        .status(400)
+        .send({ message: 'Kunci konfigurasi atau nilai tidak valid.' });
     }
   } else {
-    res.status(404).send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
+    res
+      .status(404)
+      .send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
   }
 });
 
-// --- FUNGSI BARU: Untuk memerintahkan perangkat masuk mode pairing ---
+// @desc    Command a device to enter re-provisioning mode
+// @route   POST /api/devices/:id/re-provision
+// @access  Private
 const enterReProvisioningMode = asyncHandler(async (req, res) => {
   const device = await Device.findById(req.params.id);
+
   if (device && device.owner.toString() === req.user.id.toString()) {
     const topic = `digihome/devices/${device.deviceId}/command`;
-    const message = { action: "ENTER_PROVISIONING" };
+    const message = { action: 'ENTER_PROVISIONING' };
     publishMqttMessage(topic, message);
     res.status(200).json({ message: 'Perintah re-provisioning terkirim.' });
   } else {
-    res.status(404).send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
+    res
+      .status(404)
+      .send({ message: 'Perangkat tidak ditemukan atau Anda tidak berwenang.' });
   }
 });
 
@@ -554,9 +600,82 @@ module.exports = {
   updateDevice,
   deleteDevice,
   getClaimStatus,
-  setDeviceConfig, 
-  enterReProvisioningMode, 
-};\`\`\`
+  setDeviceConfig,
+  enterReProvisioningMode,
+};
+\`\`\`
+.
+.
+## File notificationController.js
+_Path: relPath:~=~_
+.
+\`\`\`javascript
+// controllers/notificationController.js
+const Notification = require('../models/Notification');
+const asyncHandler = require('../middleware/asyncHandler');
+
+/**
+ * @desc    Mengambil semua notifikasi untuk pengguna yang sedang login.
+ * @route   GET /api/notifications
+ * @access  Private
+ */
+const getUserNotifications = asyncHandler(async (req, res) => {
+  // --- BLOK DEBUGGING & PERBAIKAN ---
+  // Log 1: Verifikasi bahwa middleware 'protect' telah berjalan dengan benar.
+  if (!req.user || !req.user._id) {
+    console.error('[Debug] FATAL: req.user atau req.user._id tidak ditemukan. Middleware `protect` mungkin gagal atau token tidak valid.');
+    // Kirim respons error yang jelas jika pengguna tidak terautentikasi.
+    res.status(401);
+    throw new Error('User tidak terautentikasi dengan benar.');
+  }
+  
+  console.log(`[Debug] Mencoba mengambil notifikasi untuk user ID: ${req.user._id}`);
+
+  try {
+    // Log 2: Jalankan query ke database dengan user ID yang sudah divalidasi.
+    console.log(`[Debug] Menjalankan query: Notification.find({ user: "${req.user._id}" })`);
+    const notifications = await Notification.find({ user: req.user._id }).sort({ createdAt: -1 });
+    
+    // Log 3: Laporkan hasilnya dan kirim respons sukses.
+    console.log(`[Debug] Ditemukan ${notifications.length} notifikasi untuk pengguna ${req.user._id}.`);
+    res.status(200).json(notifications);
+
+  } catch (error) {
+    // Log 4: Tangkap error spesifik dari database atau proses lainnya.
+    console.error(`[Debug] Terjadi error saat query database untuk user ${req.user._id}:`, error);
+    res.status(500); // Set status ke 500 Internal Server Error
+    throw new Error('Terjadi kesalahan pada server saat mengambil notifikasi.');
+  }
+});
+
+
+/**
+ * @desc    Menandai satu notifikasi sebagai sudah dibaca.
+ * @route   PUT /api/notifications/:id/read
+ * @access  Private
+ */
+const markAsRead = asyncHandler(async (req, res) => {
+  // Pastikan req.user ada sebelum melanjutkan
+  if (!req.user || !req.user._id) {
+    res.status(401);
+    throw new Error('User tidak terautentikasi.');
+  }
+
+  const notification = await Notification.findById(req.params.id);
+
+  // Pastikan notifikasi ada dan dimiliki oleh pengguna yang sedang login
+  if (notification && notification.user.toString() === req.user._id.toString()) {
+    notification.isRead = true;
+    await notification.save();
+    res.json({ message: 'Notification marked as read' });
+  } else {
+    res.status(404);
+    throw new Error('Notification not found or you are not authorized');
+  }
+});
+
+module.exports = { getUserNotifications, markAsRead };
+\`\`\`
 .
 .
 ## File powerLogController.js
@@ -795,66 +914,118 @@ module.exports = {
 _Path: relPath:~=~_
 .
 \`\`\`javascript
+// controllers/userController.js
 const User = require('../models/User');
 const generateToken = require('../utils/generateToken');
+const asyncHandler = require('../middleware/asyncHandler');
+const { sendNotificationToUser } = require('../services/notification_service'); // Impor service notifikasi
 
 // @desc    Mendaftarkan pengguna baru
-// @route   POST /api/users/register
-const registerUser = async (req, res) => {
+const registerUser = asyncHandler(async (req, res) => {
   const { name, email, password } = req.body;
-
-  try {
-    const userExists = await User.findOne({ email });
-    if (userExists) {
-      return res.status(400).json({ message: 'Email sudah terdaftar' });
-    }
-
-    const user = await User.create({
-      name,
-      email,
-      password, // Password akan di-hash secara otomatis oleh pre-save hook di model
-    });
-
-    if (user) {
-      res.status(201).json({
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        token: generateToken(user._id),
-      });
-    } else {
-      res.status(400).json({ message: 'Data pengguna tidak valid' });
-    }
-  } catch (error) {
-    res.status(500).json({ message: 'Server Error' });
+  const userExists = await User.findOne({ email });
+  if (userExists) {
+    res.status(400);
+    throw new Error('Email sudah terdaftar');
   }
-};
+  const user = await User.create({ name, email, password });
+  if (user) {
+    res.status(201).json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      token: generateToken(user._id),
+    });
+  } else {
+    res.status(400);
+    throw new Error('Data pengguna tidak valid');
+  }
+});
 
 // @desc    Login pengguna & mendapatkan token
-// @route   POST /api/users/login
-const loginUser = async (req, res) => {
+const loginUser = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
+  const user = await User.findOne({ email });
 
-  try {
-    const user = await User.findOne({ email });
+  if (user && (await user.matchPassword(password))) {
+    // ================== PERUBAHAN PENTING (1/2) ==================
+    // Logika pengiriman notifikasi DIHAPUS dari sini untuk
+    // memperbaiki race condition. Backend sekarang hanya fokus
+    // memberikan token otentikasi.
+    // =============================================================
 
-    // Cek apakah pengguna ada DAN password-nya cocok
-    if (user && (await user.matchPassword(password))) {
-      res.json({
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        token: generateToken(user._id),
-      });
-    } else {
-      res.status(401).json({ message: 'Email atau password salah' });
-    }
-  } catch (error) {
-    res.status(500).json({ message: 'Server Error' });
+    res.json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      token: generateToken(user._id),
+    });
+  } else {
+    res.status(401);
+    throw new Error('Email atau password salah');
   }
-};
+});
 
-module.exports = { registerUser, loginUser };
+// @desc    Mendaftarkan atau memperbarui FCM token untuk pengguna
+const registerFcmToken = asyncHandler(async (req, res) => {
+  const { token } = req.body;
+  if (!token) {
+    res.status(400);
+    throw new Error('Token tidak ditemukan di body request');
+  }
+  const user = await User.findById(req.user._id);
+
+  if (user) {
+    const isNewToken = !user.fcmTokens.includes(token);
+
+    // Simpan token ke database
+    user.fcmTokens = [...new Set([...user.fcmTokens, token])];
+    await user.save();
+    
+    // ================== PERUBAHAN PENTING (2/2) ==================
+    // Notifikasi "Selamat Datang" sekarang dikirim dari sini,
+    // SETELAH token berhasil disimpan.
+    // Ini juga hanya akan dikirim jika token tersebut baru,
+    // untuk menghindari spam setiap kali pengguna membuka aplikasi.
+    if (isNewToken) {
+      await sendNotificationToUser(
+        user._id,
+        'Selamat Datang di DigiHome!',
+        `Akun Anda sekarang siap untuk menerima notifikasi di perangkat ini.`
+      );
+    }
+    // =============================================================
+
+    res.status(200).json({ message: 'Token berhasil disimpan' });
+  } else {
+    res.status(404);
+    throw new Error('Pengguna tidak ditemukan');
+  }
+});
+
+const testBudgetNotification = asyncHandler(async (req, res) => {
+  // Untuk menyederhanakan, kita panggil fungsi yang sama dengan yang dijalankan cron
+  // NOTE: Anda perlu mengekspor checkUserBudgets dari scheduler_service.js
+  // Jika belum, untuk sementara kita bisa pindahkan logikanya ke sini.
+  // Mari kita asumsikan kita akan memindahkannya ke service terpisah nanti.
+  // Untuk sekarang, kita panggil dummy function.
+  
+  // Kirim notifikasi tes langsung ke pengguna yang sedang login
+  await sendNotificationToUser(
+    req.user._id, 
+    'Uji Coba Notifikasi Budget', 
+    'Jika Anda melihat ini, maka pemicu notifikasi berfungsi!'
+  );
+
+  res.status(200).json({ message: 'Perintah tes notifikasi budget telah dijalankan.' });
+});
+
+module.exports = {
+  registerUser,
+  loginUser,
+  registerFcmToken,
+  testBudgetNotification,
+};
 \`\`\`
 .
 .
@@ -1005,6 +1176,60 @@ const Device = mongoose.model('Device', deviceSchema);
 module.exports = Device;\`\`\`
 .
 .
+## File Notification.js
+_Path: relPath:~=~_
+.
+\`\`\`javascript
+// models/Notification.js
+const mongoose = require('mongoose');
+
+/**
+ * Skema untuk menyimpan riwayat notifikasi yang dikirim ke pengguna.
+ * Ini memungkinkan aplikasi untuk menampilkan halaman riwayat notifikasi.
+ */
+const notificationSchema = new mongoose.Schema(
+  {
+    // Referensi ke pengguna yang menerima notifikasi
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      required: true,
+      ref: 'User',
+    },
+    // Judul notifikasi yang ditampilkan
+    title: {
+      type: String,
+      required: true,
+    },
+    // Isi pesan notifikasi
+    body: {
+      type: String,
+      required: true,
+    },
+    // Menyimpan data tambahan (payload) yang dikirim bersama notifikasi.
+    // Berguna untuk navigasi di aplikasi (misal: membuka halaman detail perangkat tertentu).
+    dataPayload: {
+      type: Map,
+      of: String,
+    },
+    // Menandai apakah notifikasi sudah dibaca oleh pengguna atau belum.
+    isRead: {
+      type: Boolean,
+      required: true,
+      default: false,
+    },
+  },
+  {
+    // Secara otomatis menambahkan field `createdAt` dan `updatedAt`
+    timestamps: true,
+  }
+);
+
+const Notification = mongoose.model('Notification', notificationSchema);
+
+module.exports = Notification;
+\`\`\`
+.
+.
 ## File PowerLog.js
 _Path: relPath:~=~_
 .
@@ -1120,28 +1345,50 @@ module.exports = Schedule;
 _Path: relPath:~=~_
 .
 \`\`\`javascript
+// models/User.js
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 
-const userSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
-}, { timestamps: true });
+const userSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true },
+    email: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    fcmTokens: {
+      type: [String],
+      default: [],
+    },
+    // ================== FIELD BARU UNTUK BUDGET & TARIF ==================
+    settings: {
+      monthlyBudget: {
+        type: Number,
+        default: 250000, // Anggaran default Rp 250.000
+      },
+      tariffTier: {
+        type: String,
+        enum: ['tier900', 'tier1300', 'tier2200', 'other'],
+        default: 'tier1300', // Golongan tarif default
+      },
+      // Menambahkan flag untuk memastikan notifikasi budget hanya dikirim sekali per bulan
+      budgetNotificationSent: {
+        month: { type: Number, default: 0 }, // Menyimpan bulan (1-12)
+        year: { type: Number, default: 0 }, // Menyimpan tahun
+      },
+    },
+    // ======================================================================
+  },
+  { timestamps: true }
+);
 
-// Middleware yang berjalan SEBELUM data disimpan (.pre('save', ...))
+// Middleware dan method lainnya tidak berubah
 userSchema.pre('save', async function (next) {
-  // Hanya lakukan hashing jika password diubah (atau baru)
   if (!this.isModified('password')) {
     next();
   }
-
-  // Generate "salt" untuk memperkuat hash, lalu hash password-nya
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
 });
 
-// Method untuk membandingkan password yang dimasukkan dengan hash di database
 userSchema.methods.matchPassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
@@ -1180,6 +1427,29 @@ router.route('/:id/re-provision').post(protect, enterReProvisioningMode);
 // ----------------------------
 
 module.exports = router;\`\`\`
+.
+.
+## File notificationRoutes.js
+_Path: relPath:~=~_
+.
+\`\`\`javascript
+// routes/notificationRoutes.js
+const express = require('express');
+const router = express.Router();
+const {
+  getUserNotifications,
+  markAsRead,
+} = require('../controllers/notificationController');
+const { protect } = require('../middleware/authMiddleware');
+
+// Route untuk GET /api/notifications -> akan memanggil getUserNotifications
+router.route('/').get(protect, getUserNotifications);
+
+// Route untuk PUT /api/notifications/:id/read -> akan memanggil markAsRead
+router.route('/:id/read').put(protect, markAsRead);
+
+module.exports = router;
+\`\`\`
 .
 .
 ## File powerLogRoutes.js
@@ -1257,12 +1527,23 @@ module.exports = router;
 _Path: relPath:~=~_
 .
 \`\`\`javascript
+// routes/userRoutes.js
 const express = require('express');
 const router = express.Router();
-const { registerUser, loginUser } = require('../controllers/userController');
+const {
+  registerUser,
+  loginUser,
+  registerFcmToken, 
+  testBudgetNotification,
+} = require('../controllers/userController');
+const { protect } = require('../middleware/authMiddleware');
 
 router.post('/register', registerUser);
 router.post('/login', loginUser);
+
+// Rute baru untuk mendaftarkan token FCM
+router.post('/fcm-token', protect, registerFcmToken);
+router.get('/test-budget-notif', protect, testBudgetNotification);
 
 module.exports = router;
 \`\`\`
@@ -1277,34 +1558,52 @@ _Path: relPath:~=~_
 const mqtt = require('mqtt');
 const PowerLog = require('../models/PowerLog');
 const Device = require('../models/Device');
+const { sendNotificationToUser } = require('./notification_service');
 
 let client = null;
 
-// --- STATE MANAGEMENT UNTUK CLAIMING ---
-// Struktur: Map<deviceId, { confirmed: boolean }>
+// Peta untuk mengelola perangkat yang sedang dalam proses provisioning
 const unclaimedDevices = new Map();
 const unclaimedDeviceTimers = new Map();
 
-// --- LOGIKA BATCH PROCESSING UNTUK TELEMETRI ---
+// Buffer untuk mengumpulkan data telemetri sebelum disimpan ke DB secara massal
 const telemetryBuffer = new Map();
-const BATCH_INTERVAL_MS = 5 * 60 * 1000;
+const BATCH_INTERVAL_MS = 5 * 60 * 1000; // Proses buffer setiap 5 menit
 
+/**
+ * Memproses buffer telemetri secara periodik.
+ * Mengagregasi data telemetri yang terkumpul untuk setiap perangkat
+ * dan menyimpannya sebagai satu entri log untuk efisiensi database.
+ */
 async function processTelemetryBuffer() {
-  if (telemetryBuffer.size === 0) return;
+  if (telemetryBuffer.size === 0) {
+    return;
+  }
   console.log(`[Batch] Memproses buffer telemetri untuk ${telemetryBuffer.size} perangkat...`);
+  
   const logsToInsert = [];
   for (const [deviceId, messages] of telemetryBuffer.entries()) {
     if (messages.length === 0) continue;
+
+    // Hitung rata-rata dari semua metrik yang terkumpul
     const avgVoltage = messages.reduce((sum, msg) => sum + (msg.voltage || 0), 0) / messages.length;
     const avgCurrent = messages.reduce((sum, msg) => sum + (msg.current || 0), 0) / messages.length;
     const avgPower = messages.reduce((sum, msg) => sum + (msg.power || 0), 0) / messages.length;
     const avgPowerFactor = messages.reduce((sum, msg) => sum + (msg.powerFactor || 0), 0) / messages.length;
+    // Ambil nilai energi terakhir sebagai nilai akumulasi saat ini
     const lastEnergyKWh = messages.length > 0 ? messages[messages.length - 1].energyKWh : 0;
+
     logsToInsert.push({
-      deviceId, timestamp: new Date(), voltage: avgVoltage, current: avgCurrent,
-      power: avgPower, energyKWh: lastEnergyKWh, powerFactor: avgPowerFactor,
+      deviceId,
+      timestamp: new Date(),
+      voltage: avgVoltage,
+      current: avgCurrent,
+      power: avgPower,
+      energyKWh: lastEnergyKWh,
+      powerFactor: avgPowerFactor,
     });
   }
+
   try {
     if (logsToInsert.length > 0) {
       await PowerLog.insertMany(logsToInsert);
@@ -1313,29 +1612,45 @@ async function processTelemetryBuffer() {
   } catch (error) {
     console.error('[Batch] Gagal menyimpan data batch:', error);
   }
+  
+  // Kosongkan buffer setelah diproses
   telemetryBuffer.clear();
 }
 
+// Jalankan pemroses buffer secara periodik
 setInterval(processTelemetryBuffer, BATCH_INTERVAL_MS);
 
-// --- FUNGSI HELPER YANG DIEKSPOR ---
+
+// Fungsi helper untuk proses klaim perangkat
 const isDeviceConfirmed = (deviceId) => unclaimedDevices.has(deviceId) && unclaimedDevices.get(deviceId).confirmed === true;
+
 const confirmDeviceClaim = (deviceId) => {
   unclaimedDevices.delete(deviceId);
   if (unclaimedDeviceTimers.has(deviceId)) {
     clearTimeout(unclaimedDeviceTimers.get(deviceId));
     unclaimedDeviceTimers.delete(deviceId);
   }
-  console.log(`[Claim] Perangkat ${deviceId} berhasil diklaim.`);
+  console.log(`[Claim] Perangkat ${deviceId} berhasil diklaim dan dihapus dari daftar tunggu.`);
 };
 
-// --- FUNGSI KONEKSI UTAMA ---
+/**
+ * Fungsi utama untuk menghubungkan ke broker MQTT dan mengatur semua listener.
+ * @param {Map} clientConnections - Peta koneksi WebSocket dari server utama.
+ */
 const connectMqtt = (clientConnections) => {
   let brokerUrl = process.env.MQTT_BROKER_URL;
-  if (!brokerUrl) { return console.error("[MQTT] Error: MQTT_BROKER_URL tidak terdefinisi."); }
-  if (!/^(mqtt|mqtts|ws|wss):\/\//.test(brokerUrl)) { brokerUrl = `mqtt://${brokerUrl}`; }
+  if (!brokerUrl) {
+    return console.error('[MQTT] Error: MQTT_BROKER_URL tidak terdefinisi.');
+  }
+  if (!/^(mqtt|mqtts|ws|wss):\/\//.test(brokerUrl)) {
+    brokerUrl = `mqtt://${brokerUrl}`;
+  }
 
-  const options = { clientId: `digihome_backend_${Math.random().toString(16).slice(2, 8)}` };
+  const options = {
+    clientId: `digihome_backend_${Math.random().toString(16).slice(2, 8)}`,
+    username: process.env.MQTT_USER,
+    password: process.env.MQTT_PASSWORD,
+  };
   client = mqtt.connect(brokerUrl, options);
 
   client.on('connect', () => {
@@ -1355,54 +1670,90 @@ const connectMqtt = (clientConnections) => {
       return;
     }
 
-    // --- PERBAIKAN: Selalu gunakan deviceId dari payload untuk konsistensi ---
-    const { deviceId } = message;
-    if (!deviceId) {
-      console.warn(`[MQTT] Menerima pesan tanpa deviceId di topik ${topic}`);
-      return;
-    }
-
     try {
-      const topicType = topic.split('/')[1]; // 'provisioning', 'devices'
+      const topicParts = topic.split('/');
+      if (topicParts.length < 3) return;
 
-      if (topicType === 'provisioning') {
-        if (topic.endsWith('/online')) {
-          console.log(`[Provisioning] Perangkat ${deviceId} online, menunggu konfirmasi fisik.`);
-          unclaimedDevices.set(deviceId, { confirmed: false });
-          const timer = setTimeout(() => {
-            if (unclaimedDevices.has(deviceId)) {
-                unclaimedDevices.delete(deviceId);
-                unclaimedDeviceTimers.delete(deviceId);
-                console.log(`[Provisioning] Batas waktu klaim untuk ${deviceId} habis.`);
-            }
-          }, 5 * 60 * 1000);
-          unclaimedDeviceTimers.set(deviceId, timer);
-        } else if (topic.endsWith('/confirm')) {
-          if (unclaimedDevices.has(deviceId)) {
-            unclaimedDevices.set(deviceId, { confirmed: true });
-            console.log(`[Provisioning] Konfirmasi fisik untuk ${deviceId} DITERIMA & STATUS DIPERBARUI.`);
-            console.log('[Provisioning] Status daftar tunggu saat ini:', Array.from(unclaimedDevices.entries()));
+      const topicType = topicParts[1];
+      const deviceIdFromTopic = topicParts[2];
+
+      if (topicType === 'devices' && topic.endsWith('/status')) {
+        const isOnline = message.online === true;
+        const device = await Device.findOne({ deviceId: deviceIdFromTopic });
+
+        if (device && device.isOnline !== isOnline) {
+          device.isOnline = isOnline;
+          await device.save();
+          console.log(`[MQTT-Status] Status perangkat ${device.name} diperbarui menjadi: ${isOnline ? 'ONLINE' : 'OFFLINE'}`);
+
+          if (!isOnline) {
+            await sendNotificationToUser(
+              device.owner,
+              `Perangkat Offline`,
+              `${device.name} tidak terhubung ke jaringan. Mohon periksa koneksi listrik dan Wi-Fi.`,
+              { 'screen': 'digiPlugDetailRoute', 'deviceId': device._id.toString() }
+            );
           }
         }
-      } else if (topicType === 'devices') {
-        if (topic.endsWith('/status')) {
-          await Device.findOneAndUpdate({ deviceId }, { isOnline: message.isOnline }, { new: true });
-        } else if (topic.endsWith('/telemetry')) {
-          const device = await Device.findOne({ deviceId });
-          if (device) {
-            // Update status WiFi
-            await device.updateOne({ wifiSsid: message.wifiSsid, wifiRssi: message.wifiRssi, isOnline: true });
-            // Teruskan ke WebSocket
-            if (device.owner) {
-              const ownerSocket = clientConnections.get(device.owner.toString());
-              if (ownerSocket && ownerSocket.readyState === 1) { 
-                  ownerSocket.send(payload.toString());
-              }
+      } else if (topicType === 'devices' && topic.endsWith('/telemetry')) {
+        const device = await Device.findOne({ deviceId: deviceIdFromTopic });
+        if (!device) return;
+        
+        await device.updateOne({ isOnline: true, lastSeen: new Date() });
+
+        if (device.owner) {
+            const ownerSocket = clientConnections.get(device.owner.toString());
+            if (ownerSocket && ownerSocket.readyState === 1) {
+                ownerSocket.send(payload.toString());
             }
-          }
-          // Simpan ke buffer
-          if (!telemetryBuffer.has(deviceId)) telemetryBuffer.set(deviceId, []);
-          telemetryBuffer.get(deviceId).push(message);
+        }
+
+        if (!telemetryBuffer.has(deviceIdFromTopic)) telemetryBuffer.set(deviceIdFromTopic, []);
+        telemetryBuffer.get(deviceIdFromTopic).push(message);
+
+      } else if (topicType === 'devices' && topic.endsWith('/alert')) {
+        const device = await Device.findOne({ deviceId: deviceIdFromTopic });
+        if (!device) return;
+        
+        let alertTitle = 'Peringatan Keamanan';
+        let alertBody = `Terdeteksi masalah pada perangkat ${device.name}.`;
+
+        if (message.error === 'OVERCURRENT_DETECTED') {
+          alertTitle = `Arus Berlebih pada ${device.name}!`;
+          alertBody = `Perangkat telah dimatikan secara otomatis untuk keamanan. Arus terdeteksi: ${message.value} A.`;
+          
+          device.active = false;
+          await device.save();
+          console.log(`[ALERT] Status perangkat ${device.name} diubah menjadi OFF di database.`);
+
+          const commandTopic = `digihome/devices/${device.deviceId}/command`;
+          const commandMessage = { action: 'SET_STATUS', payload: 'OFF' };
+          publishMqttMessage(commandTopic, commandMessage);
+          console.log(`[ALERT] Perintah OFF dikirim ke topik ${commandTopic}.`);
+        }
+        
+        await sendNotificationToUser(device.owner, alertTitle, alertBody);
+
+      } else if (topicType === 'provisioning') {
+        const deviceIdFromMessage = message.deviceId;
+        if (!deviceIdFromMessage) return;
+
+        if (topic.endsWith('/online')) {
+            console.log(`[Provisioning] Perangkat ${deviceIdFromMessage} online, menunggu konfirmasi fisik.`);
+            unclaimedDevices.set(deviceIdFromMessage, { confirmed: false });
+            const timer = setTimeout(() => {
+                if (unclaimedDevices.has(deviceIdFromMessage)) {
+                    unclaimedDevices.delete(deviceIdFromMessage);
+                    unclaimedDeviceTimers.delete(deviceIdFromMessage);
+                    console.log(`[Provisioning] Batas waktu klaim untuk ${deviceIdFromMessage} habis.`);
+                }
+            }, 5 * 60 * 1000); // Timeout 5 menit
+            unclaimedDeviceTimers.set(deviceIdFromMessage, timer);
+        } else if (topic.endsWith('/confirm')) {
+            if (unclaimedDevices.has(deviceIdFromMessage)) {
+                unclaimedDevices.set(deviceIdFromMessage, { confirmed: true });
+                console.log(`[Provisioning] Konfirmasi fisik untuk ${deviceIdFromMessage} DITERIMA.`);
+            }
         }
       }
     } catch (error) {
@@ -1413,6 +1764,11 @@ const connectMqtt = (clientConnections) => {
   client.on('error', (error) => console.error('[MQTT] Error koneksi:', error));
 };
 
+/**
+ * Mempublikasikan pesan ke topik MQTT tertentu.
+ * @param {string} topic - Topik tujuan.
+ * @param {object} message - Objek pesan yang akan dikirim (akan di-stringify).
+ */
 const publishMqttMessage = (topic, message) => {
   if (client && client.connected) {
       const payload = JSON.stringify(message);
@@ -1422,7 +1778,109 @@ const publishMqttMessage = (topic, message) => {
   }
 };
 
-module.exports = { connectMqtt, publishMqttMessage, isDeviceConfirmed, confirmDeviceClaim, unclaimedDevices };
+module.exports = {
+  connectMqtt,
+  publishMqttMessage,
+  isDeviceConfirmed,
+  confirmDeviceClaim,
+  unclaimedDevices,
+};
+\`\`\`
+.
+.
+## File notification_service.js
+_Path: relPath:~=~_
+.
+\`\`\`javascript
+// services/notification_service.js
+const admin = require('firebase-admin');
+const User = require('../models/User');
+const Notification = require('../models/Notification'); // <-- BARU
+
+try {
+  const serviceAccount = require('../firebase-service-account_digihome.json');
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+  console.log('[FCM] Firebase Admin SDK berhasil diinisialisasi.');
+} catch (error) {
+  console.error(
+    '[FCM] GAGAL inisialisasi Firebase Admin SDK. Pastikan file "firebase-service-account_digihome.json" ada dan path-nya benar.',
+    error.message
+  );
+}
+
+// /**
+//  * Mengirim notifikasi ke semua perangkat milik satu pengguna dan menyimpannya ke database.
+//  * @param {string} userId ID pengguna (dari MongoDB) yang akan dikirimi notifikasi.
+//  * @param {string} title Judul notifikasi.
+//  * @param {string} body - Isi pesan notifikasi.
+//  * @param {object} [data={}] - Data tambahan yang ingin dikirim (misal: deviceId).
+//  */
+async function sendNotificationToUser(userId, title, body, data = {}) {
+  try {
+    const user = await User.findById(userId);
+    if (!user || !user.fcmTokens || user.fcmTokens.length === 0) {
+      console.log(`[FCM] Pengguna ${userId} tidak memiliki token untuk dikirimi notifikasi.`);
+      return;
+    }
+
+    const message = {
+      notification: {
+        title: title,
+        body: body,
+      },
+      tokens: user.fcmTokens,
+      data: data,
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          channel_id: 'high_importance_channel',
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+          },
+        },
+      },
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log(`[FCM] Berhasil mengirim notifikasi ke ${response.successCount} token untuk pengguna ${userId}`);
+
+    // --- BLOK BARU: Simpan notifikasi ke database ---
+    // Ini dieksekusi HANYA jika pengiriman FCM berhasil
+    if (response.successCount > 0) {
+      await Notification.create({
+        user: userId,
+        title: title,
+        body: body,
+        dataPayload: data,
+      });
+      console.log(`[Notification] Notifikasi untuk user ${userId} juga disimpan ke DB.`);
+    }
+    // --- AKHIR BLOK BARU ---
+
+    if (response.failureCount > 0) {
+      const tokensToRemove = [];
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success) {
+          tokensToRemove.push(user.fcmTokens[idx]);
+        }
+      });
+      console.log(`[FCM] Menghapus token tidak valid: ${tokensToRemove}`);
+      await User.updateOne({ _id: userId }, { $pullAll: { fcmTokens: tokensToRemove } });
+    }
+  } catch (error) {
+    console.error(`[FCM] Gagal mengirim atau menyimpan notifikasi ke pengguna ${userId}:`, error);
+  }
+}
+
+module.exports = { sendNotificationToUser };
 \`\`\`
 .
 .
@@ -1540,87 +1998,162 @@ _Path: relPath:~=~_
 .
 \`\`\`javascript
 // services/scheduler_service.js
-
 const cron = require('node-cron');
 const Schedule = require('../models/Schedule');
 const Device = require('../models/Device');
+const User = require('../models/User'); // Ditambahkan untuk budget
+const PowerLog = require('../models/PowerLog'); // Ditambahkan untuk budget
 const { WebSocket } = require('ws');
+const { publishMqttMessage } = require('./mqtt_service');
+const { sendNotificationToUser } = require('./notification_service'); // Ditambahkan untuk budget
 
-// Helper untuk memetakan nama hari ke angka (Minggu=0, Senin=1, ...)
-const dayMap = {
-  'Min': 0, 'Sen': 1, 'Sel': 2, 'Rab': 3, 'Kam': 4, 'Jum': 5, 'Sab': 6
+// Helper untuk memetakan nama hari (dari kode asli Anda)
+const dayMapEnToId = {
+  Sun: 'Min', Mon: 'Sen', Tue: 'Sel',
+  Wed: 'Rab', Thu: 'Kam', Fri: 'Jum', Sat: 'Sab',
 };
 
-/**
- * Memulai Scheduler Engine yang berjalan setiap menit.
- * @param {Map<string, WebSocket>} clientConnections - Map dari userId ke koneksi WebSocket.
- */
-const startScheduler = (clientConnections) => {
-  console.log('[Scheduler] Engine is running. Checking for tasks every minute.');
+// Definisikan tarif listrik di backend agar konsisten
+const TARIFF_RATES = {
+  tier900: 1352.0,
+  tier1300: 1444.7,
+  tier2200: 1444.7,
+  other: 1699.5,
+};
 
-  // Jadwalkan tugas untuk berjalan setiap menit: '* * * * *'
+// ================== FUNGSI BARU UNTUK PENGECEKAN BUDGET ==================
+async function checkUserBudgets() {
+  console.log('[Budget] Memulai pengecekan budget pengguna...');
+  const now = new Date();
+  // Menggunakan waktu Jakarta untuk konsistensi
+  const jakartaTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Jakarta' }));
+  const currentMonth = jakartaTime.getMonth() + 1;
+  const currentYear = jakartaTime.getFullYear();
+
+  const users = await User.find({});
+
+  for (const user of users) {
+    if (user.settings.budgetNotificationSent?.month === currentMonth && user.settings.budgetNotificationSent?.year === currentYear) {
+      continue;
+    }
+
+    const startOfMonth = new Date(currentYear, currentMonth - 1, 1);
+    const endOfMonth = new Date(currentYear, currentMonth, 0, 23, 59, 59);
+
+    const userDevices = await Device.find({ owner: user._id }).select('deviceId');
+    const userDeviceIds = userDevices.map(d => d.deviceId);
+
+    let totalKwhThisMonth = 0;
+    for (const deviceId of userDeviceIds) {
+      const firstLog = await PowerLog.findOne({ deviceId, timestamp: { $gte: startOfMonth } }).sort({ timestamp: 1 });
+      const lastLog = await PowerLog.findOne({ deviceId, timestamp: { $lte: endOfMonth } }).sort({ timestamp: -1 });
+
+      if (firstLog && lastLog && lastLog.energyKWh > firstLog.energyKWh) {
+        totalKwhThisMonth += (lastLog.energyKWh - firstLog.energyKWh);
+      }
+    }
+
+    const userTariff = TARIFF_RATES[user.settings.tariffTier] || TARIFF_RATES['tier1300'];
+    const estimatedCost = totalKwhThisMonth * userTariff;
+    const budget = user.settings.monthlyBudget;
+    
+    if (budget > 0) {
+        const usagePercentage = (estimatedCost / budget) * 100;
+
+        if (usagePercentage > 80) {
+          const title = 'Peringatan Anggaran Listrik';
+          const body = `Pemakaian bulan ini telah mencapai ${usagePercentage.toFixed(0)}% (Rp ${Math.round(estimatedCost).toLocaleString('id-ID')}) dari anggaran Anda.`;
+          
+          await sendNotificationToUser(user._id, title, body);
+
+          user.settings.budgetNotificationSent = { month: currentMonth, year: currentYear };
+          await user.save();
+        }
+    }
+  }
+  console.log('[Budget] Pengecekan budget selesai.');
+}
+// ==========================================================================
+
+const startScheduler = (clientConnections) => {
+  console.log('[Scheduler] Engine is running.');
+
+  // ================== JADWAL PERANGKAT (DARI KODE ASLI ANDA) ==================
+  // Tugas ini tetap berjalan setiap menit untuk mengeksekusi jadwal ON/OFF perangkat.
   cron.schedule('* * * * *', async () => {
     const now = new Date();
-    const currentDay = Object.keys(dayMap).find(key => dayMap[key] === now.getDay());
-    const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    const dayFormatter = new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Jakarta', weekday: 'short' });
+    const jakartaDayShort = dayFormatter.format(now);
+    const currentDay = dayMapEnToId[jakartaDayShort];
+    const timeFormatter = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Jakarta', hour: '2-digit', minute: '2-digit', hour12: false });
+    const currentTime = timeFormatter.format(now);
 
-    console.log(`[Scheduler] Checking for tasks at ${currentTime} on ${currentDay}...`);
-
+    // ... (SELURUH BLOK LOGIKA 'try-catch' UNTUK JADWAL PERANGKAT DARI KODE ASLI ANDA TETAP DI SINI) ...
     try {
-      // Cari semua jadwal yang aktif, cocok dengan hari dan waktu saat ini
-      const dueSchedules = await Schedule.find({
-        isEnabled: true,
-        days: currentDay,
-        $or: [
-          { startTime: currentTime },
-          { endTime: currentTime }
-        ]
-      });
+        const dueSchedules = await Schedule.find({
+          isEnabled: true,
+          days: currentDay,
+          $or: [{ startTime: currentTime }, { endTime: currentTime }],
+        });
 
-      if (dueSchedules.length === 0) {
-        return; // Tidak ada tugas, selesai untuk menit ini.
-      }
+        if (dueSchedules.length === 0) return;
 
-      console.log(`[Scheduler] Found ${dueSchedules.length} due tasks.`);
+        console.log(`[Scheduler] Found ${dueSchedules.length} due tasks.`);
 
-      for (const schedule of dueSchedules) {
-        const targetState = schedule.startTime === currentTime ? schedule.action === 'ON' : schedule.action !== 'ON';
-        
-        const device = await Device.findOne({ deviceId: schedule.deviceId, owner: schedule.owner });
+        for (const schedule of dueSchedules) {
+          let targetState;
+          if (schedule.startTime === currentTime) {
+            targetState = schedule.action === 'ON';
+          } else {
+            targetState = !(schedule.action === 'ON');
+          }
 
-        if (!device) {
-          console.log(`[Scheduler] Device ${schedule.deviceId} not found for schedule ${schedule.scheduleName}.`);
-          continue;
-        }
+          const device = await Device.findOne({ deviceId: schedule.deviceId, owner: schedule.owner });
+          if (!device) {
+            console.log(`[Scheduler] Device ${schedule.deviceId} not found for schedule ${schedule._id}`);
+            continue;
+          }
 
-        // Hanya eksekusi jika status perangkat berbeda dengan target
-        if (device.active !== targetState) {
-          device.active = targetState;
-          await device.save();
-          console.log(`[Scheduler] Executed: Set device ${device.name} to ${targetState ? 'ON' : 'OFF'}`);
+          if (device.active !== targetState) {
+            device.active = targetState;
+            await device.save();
+            console.log(`[Scheduler] Executed DB update: Set device ${device.name} to ${targetState ? 'ON' : 'OFF'}`);
 
-          // Kirim pembaruan real-time ke pengguna yang tepat
-          const ownerSocket = clientConnections.get(device.owner.toString());
-          if (ownerSocket && ownerSocket.readyState === WebSocket.OPEN) {
-            // Kita kirim pesan "telemetry" palsu agar UI bereaksi
-            const payload = JSON.stringify({
-              deviceId: device.deviceId,
-              timestamp: new Date().toISOString(),
-              power: targetState ? (Math.random() * 50 + 10) : 0, // Data daya acak
-              voltage: 220,
-              current: targetState ? (Math.random() * 0.5) : 0,
-              energyKWh: 0, // Tidak relevan untuk update status
-              powerFactor: 0.9
-            });
-            ownerSocket.send(payload);
-            console.log(`[Scheduler] Notified user ${device.owner} about status change.`);
+            const topic = `digihome/devices/${device.deviceId}/command`;
+            const message = { action: 'SET_STATUS', payload: targetState ? 'ON' : 'OFF' };
+            publishMqttMessage(topic, message);
+            console.log(`[Scheduler] Published MQTT command to ${topic}`);
+
+            const ownerSocket = clientConnections.get(device.owner.toString());
+            if (ownerSocket && ownerSocket.readyState === WebSocket.OPEN) {
+              const payload = JSON.stringify({
+                deviceId: device.deviceId,
+                timestamp: new Date().toISOString(),
+                power: targetState ? Math.random() * 50 + 10 : 0,
+                voltage: 220,
+                current: targetState ? Math.random() * 0.5 : 0,
+                energyKWh: 0,
+                powerFactor: 0.9,
+                status: targetState ? 'ON' : 'OFF',
+              });
+              ownerSocket.send(payload);
+              console.log(`[Scheduler] Notified user ${device.owner} about status change.`);
+            }
           }
         }
-      }
     } catch (error) {
-      console.error('[Scheduler] Error during task execution:', error);
+    console.error('[Scheduler] Error during task execution:', error);
     }
+  }, { scheduled: true, timezone: 'Asia/Jakarta' });
+  // =================================================================================
+
+  // ================== JADWAL BARU UNTUK BUDGET ==================
+  // Jadwalkan pengecekan budget untuk berjalan sekali setiap hari pukul 08:00 pagi.
+  cron.schedule('0 8 * * *', checkUserBudgets, {
+    scheduled: true,
+    timezone: 'Asia/Jakarta',
   });
+  // ===============================================================
 };
 
 module.exports = { startScheduler };

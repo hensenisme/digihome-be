@@ -6,6 +6,7 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const url = require('url');
 const jwt = require('jsonwebtoken');
+const notificationRoutes = require('./routes/notificationRoutes');
 
 const connectDB = require('./config/db');
 const { connectMqtt } = require('./services/mqtt_service');
@@ -18,6 +19,7 @@ const deviceRoutes = require('./routes/deviceRoutes');
 const userRoutes = require('./routes/userRoutes');
 const roomRoutes = require('./routes/roomRoutes');
 const scheduleRoutes = require('./routes/scheduleRoutes');
+
 
 dotenv.config();
 
@@ -64,10 +66,11 @@ app.use('/api/devices', deviceRoutes);
 app.use('/api/rooms', roomRoutes);
 app.use('/api/logs', powerLogRoutes);
 app.use('/api/schedules', scheduleRoutes);
-
+app.use('/api/notifications', notificationRoutes);
 // Error Middleware
 app.use(notFound);
 app.use(errorHandler);
+
 
 const PORT = process.env.PORT || 5000;
 
